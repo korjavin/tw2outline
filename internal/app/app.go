@@ -32,6 +32,7 @@ type App struct {
 	Metrics   *Metrics
 	Mux       *http.ServeMux
 	Ntfy      ntfy.Client
+	server    *http.Server
 }
 
 // New creates a new App.
@@ -51,6 +52,42 @@ func New() (*App, error) {
 
 	outlineClient := outline.NewClient(cfg.OutlineURL, cfg.OutlineToken)
 	mux := http.NewServeMux()
+	metrics := NewMetrics(cfg.CheckInterval)
+
+	// Register dashboard routes before starting the server.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(getDashboardHTML(metrics.GetSafeCopy())))
+	})
+	mux.HandleFunc("/api/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		jsonData, err := json.MarshalIndent(metrics.GetSafeCopy(), "", "  ")
+		if err != nil {
+			http.Error(w, "Failed to encode metrics", http.StatusInternalServerError)
+			return
+		}
+		w.Write(jsonData)
+	})
+
+	// Start the HTTP server BEFORE initialising the Twitter client.
+	// twitter.NewClient() blocks waiting for the OAuth /callback redirect when
+	// no token file exists, so the server must already be listening when the
+	// user visits the Twitter auth URL.
+	port := cfg.CallbackPort
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+	go func() {
+		log.Info("Starting web server on http://localhost:%s", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Error("Web server error: %v", err)
+		}
+	}()
 
 	twitterClient, err := twitter.NewClient(cfg, log, mux)
 	if err != nil {
@@ -65,9 +102,10 @@ func New() (*App, error) {
 		Storage: store,
 		Outline: outlineClient,
 		Twitter: twitterClient,
-		Metrics: NewMetrics(cfg.CheckInterval),
+		Metrics: metrics,
 		Mux:     mux,
 		Ntfy:    ntfyClient,
+		server:  server,
 	}
 
 	app.Scheduler = scheduler.NewSimpleScheduler(cfg.CheckInterval, app.processBookmarks, log)
@@ -78,23 +116,6 @@ func New() (*App, error) {
 // Run starts the application.
 func (a *App) Run() {
 	a.Logger.Info("Starting application")
-
-	// Setup web server
-	a.Mux.HandleFunc("/", a.handleDashboard)
-	a.Mux.HandleFunc("/api/metrics", a.handleMetrics)
-
-	port := a.Config.CallbackPort
-	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: a.Mux,
-	}
-
-	go func() {
-		a.Logger.Info("Starting web server on http://localhost:%s", port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			a.Logger.Error("Web server error: %v", err)
-		}
-	}()
 
 	// Cleanup processed bookmarks if requested
 	if a.Config.CleanupProcessedBookmarks {
@@ -121,7 +142,7 @@ func (a *App) Run() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
+	if err := a.server.Shutdown(ctx); err != nil {
 		a.Logger.Error("Web server shutdown error: %v", err)
 	}
 
@@ -251,26 +272,7 @@ func (m *Metrics) GetSafeCopy() Metrics {
 	return *m
 }
 
-func (a *App) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html")
-	metrics := a.Metrics.GetSafeCopy()
-	w.Write([]byte(getDashboardHTML(metrics)))
-}
 
-func (a *App) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	metrics := a.Metrics.GetSafeCopy()
-	jsonData, err := json.MarshalIndent(metrics, "", "  ")
-	if err != nil {
-		http.Error(w, "Failed to encode metrics", http.StatusInternalServerError)
-		return
-	}
-	w.Write(jsonData)
-}
 
 func getDashboardHTML(metrics Metrics) string {
 	statusColor := "#22c55e"
