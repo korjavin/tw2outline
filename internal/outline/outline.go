@@ -1,0 +1,270 @@
+package outline
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Client talks to a self-hosted Outline instance.
+type Client struct {
+	baseURL    string
+	token      string
+	httpClient *http.Client
+}
+
+// NewClient builds a client for the given base URL (e.g. https://outline.example.com)
+// and API token (Bearer credential created in Outline > Settings > API Tokens).
+func NewClient(baseURL, token string) *Client {
+	return &Client{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		token:      token,
+		httpClient: &http.Client{Timeout: 60 * time.Second},
+	}
+}
+
+type createDocumentRequest struct {
+	Title        string `json:"title"`
+	Text         string `json:"text"`
+	CollectionID string `json:"collectionId"`
+	Publish      bool   `json:"publish"`
+}
+
+type createDocumentResponse struct {
+	Data struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+		URL   string `json:"url"`
+	} `json:"data"`
+}
+
+// doWithRetry executes build() and retries on HTTP 429 with exponential backoff
+// (capped at 30s), honoring a Retry-After header when present. The caller owns
+// the returned response body. build() is called once per attempt so it can
+// produce a fresh request body each time.
+func (c *Client) doWithRetry(label string, build func() (*http.Request, error)) (*http.Response, error) {
+	const maxAttempts = 6
+	backoff := time.Second
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := build()
+		if err != nil {
+			return nil, fmt.Errorf("build %s request: %w", label, err)
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", label, err)
+		}
+		if resp.StatusCode != http.StatusTooManyRequests || attempt == maxAttempts {
+			return resp, nil
+		}
+		wait := backoff
+		if hinted := parseRetryAfter(resp.Header.Get("Retry-After")); hinted > 0 {
+			wait = hinted
+		}
+		resp.Body.Close()
+		log.Printf("%s rate limited (attempt %d/%d), retrying in %s", label, attempt, maxAttempts, wait)
+		time.Sleep(wait)
+		backoff *= 2
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+	}
+	return nil, fmt.Errorf("%s: exhausted retries", label)
+}
+
+// parseRetryAfter accepts the two Retry-After forms (delay seconds or HTTP date)
+// and returns the duration to wait, or 0 if unparseable.
+func parseRetryAfter(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// CreateDocument publishes a new document into the given collection and returns its ID.
+func (c *Client) CreateDocument(collectionID, title, text string) (string, error) {
+	body, err := json.Marshal(createDocumentRequest{
+		Title:        title,
+		Text:         text,
+		CollectionID: collectionID,
+		Publish:      true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal documents.create: %w", err)
+	}
+
+	resp, err := c.doWithRetry("documents.create", func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", c.baseURL+"/api/documents.create", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		return req, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("documents.create status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var out createDocumentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("decode documents.create response: %w", err)
+	}
+	return out.Data.ID, nil
+}
+
+type createAttachmentRequest struct {
+	Name        string `json:"name"`
+	ContentType string `json:"contentType"`
+	Size        int64  `json:"size"`
+}
+
+type createAttachmentResponse struct {
+	Data struct {
+		UploadURL  string            `json:"uploadUrl"`
+		Form       map[string]string `json:"form"`
+		Attachment struct {
+			ID  string `json:"id"`
+			URL string `json:"url"`
+		} `json:"attachment"`
+	} `json:"data"`
+}
+
+// UploadAttachment uploads a file to Outline and returns a URL safe to embed in markdown.
+// Outline's flow is two requests: ask for a presigned upload, then POST the bytes to it.
+func (c *Client) UploadAttachment(name, contentType string, data []byte) (string, error) {
+	reqBody, err := json.Marshal(createAttachmentRequest{
+		Name:        name,
+		ContentType: contentType,
+		Size:        int64(len(data)),
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal attachments.create: %w", err)
+	}
+
+	resp, err := c.doWithRetry("attachments.create", func() (*http.Request, error) {
+		req, err := http.NewRequest("POST", c.baseURL+"/api/attachments.create", bytes.NewReader(reqBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		return req, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("attachments.create status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var presign createAttachmentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&presign); err != nil {
+		return "", fmt.Errorf("decode attachments.create response: %w", err)
+	}
+
+	formKeys := make([]string, 0, len(presign.Data.Form))
+	for k := range presign.Data.Form {
+		formKeys = append(formKeys, k)
+	}
+	sort.Strings(formKeys)
+	log.Printf("attachments.create ok: uploadUrl=%s formFields=%v attachmentURL=%s",
+		presign.Data.UploadURL, formKeys, presign.Data.Attachment.URL)
+
+	// Build multipart body: form fields first, file last (S3 enforces this order).
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	for _, k := range formKeys {
+		if err := writer.WriteField(k, presign.Data.Form[k]); err != nil {
+			return "", fmt.Errorf("write form field %s: %w", k, err)
+		}
+	}
+	fileHeader := make(textproto.MIMEHeader)
+	fileHeader.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename=%q`, name))
+	fileHeader.Set("Content-Type", contentType)
+	part, err := writer.CreatePart(fileHeader)
+	if err != nil {
+		return "", fmt.Errorf("create file part: %w", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		return "", fmt.Errorf("write file bytes: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("close multipart writer: %w", err)
+	}
+
+	uploadURL := presign.Data.UploadURL
+	if strings.HasPrefix(uploadURL, "/") {
+		uploadURL = c.baseURL + uploadURL
+	}
+
+	multipartBody := buf.Bytes()
+	multipartContentType := writer.FormDataContentType()
+	uploadResp, err := c.doWithRetry("files.create", func() (*http.Request, error) {
+		uploadReq, err := http.NewRequest("POST", uploadURL, bytes.NewReader(multipartBody))
+		if err != nil {
+			return nil, err
+		}
+		uploadReq.Header.Set("Content-Type", multipartContentType)
+		uploadReq.Header.Set("Authorization", "Bearer "+c.token)
+		return uploadReq, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("upload to %s: %w", uploadURL, err)
+	}
+	defer uploadResp.Body.Close()
+
+	if uploadResp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(uploadResp.Body)
+		return "", fmt.Errorf("upload status %d to %s: %s",
+			uploadResp.StatusCode, uploadURL, strings.TrimSpace(string(raw)))
+	}
+
+	attachmentURL := presign.Data.Attachment.URL
+	if strings.HasPrefix(attachmentURL, "/") {
+		attachmentURL = c.baseURL + attachmentURL
+	}
+	return attachmentURL, nil
+}
+
+// DownloadFile fetches the bytes at fileURL.
+func DownloadFile(fileURL string) ([]byte, error) {
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return nil, fmt.Errorf("download %s: %w", fileURL, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download %s: status %d", fileURL, resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}

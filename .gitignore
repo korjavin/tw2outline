@@ -1,0 +1,21 @@
+# Binaries / build artifacts
+tw2outline
+*.exe
+
+# Secrets & tokens
+.env
+token.json
+cache.json
+data/
+
+# Go workspace
+vendor/
+go.sum
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
