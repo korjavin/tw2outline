@@ -29,7 +29,7 @@ services:
     volumes:
       - tw2outline_data:/app/data
     ports:
-      - "${CALLBACK_PORT:-8080}:8080"
+      - "${CALLBACK_PORT:-8080}:${CALLBACK_PORT:-8080}"
     healthcheck:
       test: ["CMD", "pgrep", "-f", "tw2outline"]
       interval: 30s
@@ -41,7 +41,7 @@ services:
       - "traefik.http.routers.tw2outline.rule=Host(`${TW2OUTLINE_DOMAIN}`)"
       - "traefik.http.routers.tw2outline.entrypoints=websecure"
       - "traefik.http.routers.tw2outline.tls.certresolver=myresolver"
-      - "traefik.http.services.tw2outline.loadbalancer.server.port=8080"
+      - "traefik.http.services.tw2outline.loadbalancer.server.port=${CALLBACK_PORT:-8080}"
       - "com.centurylinklabs.watchtower.enable=true"
 
 volumes:
