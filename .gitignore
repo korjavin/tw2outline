@@ -10,7 +10,6 @@ data/
 
 # Go workspace
 vendor/
-go.sum
 
 # macOS
 .DS_Store
