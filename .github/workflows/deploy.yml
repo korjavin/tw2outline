@@ -78,12 +78,4 @@ jobs:
         if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
         uses: distributhor/workflow-webhook@v3
         with:
-          webhook_url: ${{ secrets.PORTAINER_WEBHOOK_URL }}
-          webhook_secret: ${{ secrets.PORTAINER_WEBHOOK_SECRET }}
-          data: >
-            {
-              "repository": "${{ github.repository }}",
-              "commit": "${{ github.sha }}",
-              "branch": "${{ github.ref_name }}",
-              "image": "ghcr.io/${{ github.repository }}:sha-${{ github.sha }}"
-            }
+          webhook_url: ${{ secrets.PORTAINER_REDEPLOY_HOOK }}
