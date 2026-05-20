@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   tw2outline:
-    image: ghcr.io/korjavin/tw2outline:latest
+    image: ghcr.io/korjavin/tw2outline:sha-00ba64f
     container_name: tw2outline
     restart: unless-stopped
     networks:
