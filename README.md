@@ -75,6 +75,8 @@ Open `http://localhost:8080` in your browser, follow the auth URL printed in the
 | `NTFY_TOPIC` | — | `tw2outline` | ntfy topic |
 | `NTFY_USERNAME` | — | — | ntfy basic auth username |
 | `NTFY_PASSWORD` | — | — | ntfy basic auth password |
+| `TRAEFIK_ENABLE` | — | `false` | Set to `true` to expose the container via Traefik |
+| `TW2OUTLINE_DOMAIN` | when `TRAEFIK_ENABLE=true` | — | Public hostname for the Traefik router, e.g. `tw.example.com`. Must match the host portion of `TWITTER_REDIRECT_URL` |
 
 ## Building
 

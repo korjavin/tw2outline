@@ -18,6 +18,11 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// ErrRateLimit signals that Twitter rejected a request with 429.
+// Callers should stop further calls to the same endpoint for the
+// current cycle rather than burning more quota.
+var ErrRateLimit = errors.New("twitter API rate limit exceeded")
+
 // Tweet represents a simplified tweet structure.
 type Tweet struct {
 	ID   string
@@ -294,6 +299,9 @@ func (c *APIClient) RemoveBookmark(tweetID string) error {
 	if resp.StatusCode == 403 {
 		return fmt.Errorf("insufficient permissions for bookmark removal - re-authorization required")
 	}
+	if resp.StatusCode == 429 {
+		return ErrRateLimit
+	}
 
 	return fmt.Errorf("failed to remove bookmark (HTTP %d)", resp.StatusCode)
 }
@@ -315,6 +323,10 @@ func (c *APIClient) CleanupProcessedBookmarks(storage storage.Storage) error {
 	for _, tweet := range tweets {
 		if storage.IsProcessed(tweet.ID) {
 			if err := c.RemoveBookmark(tweet.ID); err != nil {
+				if errors.Is(err, ErrRateLimit) {
+					c.logger.Warn("Rate limit hit during cleanup after %d removals; will resume next cycle", removed)
+					break
+				}
 				c.logger.Warn("Failed to remove processed bookmark %s: %v", tweet.ID, err)
 				failed++
 				continue

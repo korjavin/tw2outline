@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -180,6 +181,7 @@ func (a *App) processBookmarks() {
 	a.Logger.Info("Found %d bookmarked tweets", len(tweets))
 
 	var processed, skipped, failed int
+	removeRateLimited := false
 	for _, tweet := range tweets {
 		if a.Storage.IsProcessed(tweet.ID) {
 			skipped++
@@ -202,9 +204,14 @@ func (a *App) processBookmarks() {
 			a.Logger.Warn("Failed to send ntfy notification for tweet %s: %v", tweet.ID, err)
 		}
 
-		if a.Config.RemoveBookmarks {
+		if a.Config.RemoveBookmarks && !removeRateLimited {
 			if err := a.Twitter.RemoveBookmark(tweet.ID); err != nil {
-				a.Logger.Warn("Failed to remove bookmark for tweet %s: %v", tweet.ID, err)
+				if errors.Is(err, twitter.ErrRateLimit) {
+					a.Logger.Warn("Twitter rate limit hit during bookmark removal; skipping remaining removals this cycle")
+					removeRateLimited = true
+				} else {
+					a.Logger.Warn("Failed to remove bookmark for tweet %s: %v", tweet.ID, err)
+				}
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
